@@ -1,51 +1,43 @@
-from typing import List, Dict, Optional, Tuple
+from typing import List, Tuple, Optional
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-import torch
-import torch.nn as nn
 import numpy as np
-from collections import defaultdict
+from scipy.interpolate import interp1d
+from scipy.optimize import root_scalar
 
-class BaseConsumer:
-    def __init__(self, value: float, gamma: float):
-        self.value = value
-        self.gamma = gamma  # Patience level
-        self.has_purchased = False
-    
-    def utility(self, price: float) -> float:
-        """Calculate immediate utility from purchasing at given price"""
-        return max(0, self.value - price)
-    
+from .utility_functions import UtilityFunction, LinearUnitDemand
+
 @dataclass
 class PriceInfo:
     """Information about the price distribution in the experiment"""
-    prices: List[float]  # List of possible prices
-    probabilities: List[float]  # Corresponding probabilities
-    delta: float  # Experiment ending probability
-    post_experiment_price: Optional[float] = None  # Expected price after experiment
+    prices: List[float]
+    probabilities: List[float]
+    delta: float
+    post_experiment_price: Optional[float] = None
 
-class ForwardLookingConsumerBase(BaseConsumer, ABC):
+class ConsumerBase(ABC):
     """Abstract base class for forward-looking consumers"""
     
+    def __init__(self, 
+                 utility_function: UtilityFunction,
+                 gamma: float,
+                 budget_constraint: float = float('inf')):
+        self.utility_function = utility_function
+        self.gamma = gamma
+        self.budget_constraint = budget_constraint
+        self.has_purchased = False
     
     @abstractmethod
     def get_continuation_value(self, price: float, price_info: PriceInfo) -> float:
-        """
-        Get value of waiting given current price and price info
-        To be implemented by specific solution methods
-        """
+        """Get value of waiting given current state"""
         pass
     
     def should_purchase(self, price: float, price_info: PriceInfo) -> bool:
-        """
-        Decide whether to purchase at current price
-        Common decision rule across all forward-looking consumers:
-        purchase if immediate utility exceeds continuation value
-        """
-        if self.has_purchased:
+        """Determine whether to purchase based on immediate utility vs continuation value"""
+        if self.has_purchased or price > self.budget_constraint:
             return False
             
-        immediate_util = self.utility(price)
+        immediate_util = self.utility_function.utility(True, price)
         continuation_value = self.get_continuation_value(price, price_info)
         
         if immediate_util >= continuation_value:
@@ -54,15 +46,24 @@ class ForwardLookingConsumerBase(BaseConsumer, ABC):
             
         return False
 
-class InfiniteHorizonConsumer(ForwardLookingConsumerBase):
-    """Implementation using asymptotic result (δ -> 0)"""
+class AnalyticConsumer(ConsumerBase):
+    """
+    Implementation using asymptotic result (δ -> 0) for linear utility case
+    Based on Corollary 3.2 from paper
+    """
+    
+    def __init__(self, value: float, gamma: float, budget_constraint: float = float('inf')):
+        util = LinearUnitDemand(value)
+        super().__init__(util, gamma, budget_constraint)
     
     def get_continuation_value(self, price: float, price_info: PriceInfo) -> float:
-        # Calculate option value from Corollary 3.2
+        """Calculate option value from Corollary 3.2"""
+        # Probability of seeing a lower price
         Q = sum(prob for p, prob in zip(price_info.prices, price_info.probabilities) 
                 if p < price)
         
         if Q > 0:
+            # Expected price discount when seeing lower price
             E = sum(prob * (price - p) for p, prob in zip(price_info.prices, price_info.probabilities)
                     if p < price) / Q
         else:
@@ -70,46 +71,82 @@ class InfiniteHorizonConsumer(ForwardLookingConsumerBase):
             
         return (self.gamma / (1 - self.gamma)) * Q * E
 
-class FiniteHorizonDPConsumer(ForwardLookingConsumerBase):
-    """Implementation using dynamic programming"""
+class GridpointConsumer(ConsumerBase):
+    """
+    General implementation using standard exogenous gridpoints method
+    Can handle any utility function specification
+    """
     
-    def __init__(self, value: float, gamma: float, max_horizon: int = 100):
-        super().__init__(value, gamma)
-        self.max_horizon = max_horizon
-        self.value_cache: Dict[Tuple[float, int], float] = {}
+    def __init__(self, 
+                 utility_function: UtilityFunction,
+                 gamma: float,
+                 grid_size: int = 100,
+                 budget_constraint: float = float('inf')):
+        super().__init__(utility_function, gamma, budget_constraint)
+        self.grid_size = grid_size
+        self.value_function = None
+        self.decision_function = None
+        self.m_grid = None
+    
+    def get_grid(self, price: float) -> np.ndarray:
+        """Create exogenous grid based on price and budget"""
+        max_m = min(price * 5000, self.budget_constraint)
+        return np.linspace(0, max_m, self.grid_size)
+
+    def euler_error(self, decision: bool, price: float, price_info: PriceInfo) -> float:
+        """Calculate euler equation error at given decision"""
+        if price > self.budget_constraint:
+            return float('-inf')
+            
+        immediate_utility = self.utility_function.utility(decision, price)
         
+        # Expected future value
+        future_value = 0
+        for p, prob in zip(price_info.prices, price_info.probabilities):
+            if self.value_function is not None:
+                future_value += prob * self.value_function(p)
+            else:
+                # Terminal period utility
+                future_value += prob * self.utility_function.utility(True, p)
+                
+        return immediate_utility - self.gamma * future_value
+
+    def solve_period(self, price: float, price_info: PriceInfo) -> Tuple[np.ndarray, np.ndarray]:
+        """Solve one period's decision problem"""
+        self.m_grid = self.get_grid(price)
+        decisions = np.zeros_like(self.m_grid)
+        
+        for i, m in enumerate(self.m_grid):
+            if m >= price:  # Can afford to purchase
+                buy_utility = self.euler_error(True, price, price_info)
+                wait_utility = self.euler_error(False, price, price_info)
+                decisions[i] = 1 if buy_utility > wait_utility else 0
+                
+        return self.m_grid, decisions
+
+    def update_value_function(self, decisions: np.ndarray, price: float):
+        """Update value function interpolation"""
+        v_points = np.array([
+            self.utility_function.utility(bool(d), price) 
+            for d in decisions
+        ])
+        
+        self.value_function = interp1d(
+            self.m_grid, v_points,
+            bounds_error=False,
+            fill_value=(v_points[0], v_points[-1])
+        )
+        
+        self.decision_function = interp1d(
+            self.m_grid, decisions,
+            bounds_error=False,
+            fill_value=(decisions[0], decisions[-1])
+        )
+    
     def get_continuation_value(self, price: float, price_info: PriceInfo) -> float:
-        """Compute continuation value using backward induction"""
-        self.value_cache.clear()
-        
-        def value_to_go(p: float, t: int) -> float:
-            if t == 0:
-                # Terminal value - assume can buy at post-experiment price
-                return self.utility(price_info.post_experiment_price) if price_info.post_experiment_price else 0
-                
-            key = (p, t)
-            if key in self.value_cache:
-                return self.value_cache[key]
-                
-            # Immediate purchase value
-            purchase_value = self.utility(p)
+        """Get continuation value using current value function"""
+        if self.value_function is None:
+            _, decisions = self.solve_period(price, price_info)
+            self.update_value_function(decisions, price)
             
-            # Expected future value if wait
-            future_value = 0
-            # Experiment continues
-            if t > 1:
-                for next_p, prob in zip(price_info.prices, price_info.probabilities):
-                    future_value += prob * value_to_go(next_p, t-1)
-                future_value *= (1 - price_info.delta)
-            
-            # Experiment ends
-            if price_info.post_experiment_price is not None:
-                future_value += price_info.delta * value_to_go(price_info.post_experiment_price, 0)
-                
-            future_value *= self.gamma
-            
-            optimal_value = max(purchase_value, future_value)
-            self.value_cache[key] = optimal_value
-            return optimal_value
-            
-        return value_to_go(price, self.max_horizon)
+        return float(self.value_function(price))

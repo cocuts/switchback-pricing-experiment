@@ -1,16 +1,13 @@
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import Optional, Dict, List
-from switchback_experiment import firms, consumers, utility_functions
 
 def simulate_firm_consumer_interaction(
     firm: firms.ExperimentingFirm,
     list_of_consumers: List[consumers.ConsumerBase],
     n_periods: int = 100,
     growth_window: int = 3,  # Window for calculating growth rate
-    base_growth_rate: float = 0.2,  # Base rate of consumer growth
-    max_growth_rate: float = 0.2,  # Cap on growth rate
-    min_growth_rate: float = -0.1,  # Floor on growth rate 
+    base_growth_rate: float = 0.1,  # Base rate of consumer growth
     seed: Optional[int] = None
 ) -> Dict:
     """
@@ -19,8 +16,9 @@ def simulate_firm_consumer_interaction(
     """
     if seed is not None:
         np.random.seed(seed)
-        
+    estimation_window = 10
     # Track metrics
+    # Other tracking metrics
     prices = []
     demands = []
     inventory = []
@@ -56,6 +54,22 @@ def simulate_firm_consumer_interaction(
         demands.append(period_demand)
         
         # Update recent demands history
+        experiment_obj.record_observation(
+            price=price,
+            demand=period_demand,
+            same_day_demand=period_demand  # In this case same as total demand
+        )
+        
+        # Estimate demand gradient periodically
+        if t > 0 and t % estimation_window == 0:
+            try:
+                gradient = experiment_obj.estimate_demand_gradient(track_same_day=True)
+                gradient_estimates.append(gradient)
+                estimation_times.append(t)
+            except Exception as e:
+                print(f"Could not estimate gradient at t={t}: {e}")
+        
+        # Population dynamics code...
         recent_demands.pop(0)
         recent_demands.append(period_demand)
         
@@ -116,13 +130,20 @@ def simulate_firm_consumer_interaction(
         profits.append(profit)
         inventory.append(firm.inventory)
         
+        # Print where we're at
+        print(t)
+        print(n_new)
+
     return {
         'prices': prices,
         'demands': demands,
         'inventory': inventory,
         'profits': profits,
         'population': population,
-        'growth_rates': growth_rates
+        'growth_rates': growth_rates,
+        'gradient_estimates': gradient_estimates,
+        'estimation_times': estimation_times,
+        'experiment': experiment_obj
     }
 
 def plot_firm_simulation(results: Dict, firm: firms.ExperimentingFirm):
@@ -192,6 +213,16 @@ def plot_firm_simulation(results: Dict, firm: firms.ExperimentingFirm):
     ax.set_xlabel('Growth Rate')
     ax.set_ylabel('Frequency')
     ax.grid(True)
+    if results['gradient_estimates']:
+        ax.plot(results['estimation_times'], 
+                results['gradient_estimates'], 
+                'o-', label='Demand Gradient')
+        ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        ax.set_title('Estimated Demand Gradient')
+        ax.set_xlabel('Period')
+        ax.set_ylabel('Gradient')
+        ax.legend()
+        ax.grid(True)
     
     plt.tight_layout()
     return fig, axes

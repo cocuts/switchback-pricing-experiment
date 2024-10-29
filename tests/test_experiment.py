@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import Optional, Dict, List
+from switchback_experiment import firms, consumers, utility_functions, experiment
 
 def simulate_firm_consumer_interaction(
     firm: firms.ExperimentingFirm,
@@ -8,6 +9,8 @@ def simulate_firm_consumer_interaction(
     n_periods: int = 100,
     growth_window: int = 3,  # Window for calculating growth rate
     base_growth_rate: float = 0.1,  # Base rate of consumer growth
+    max_growth_rate: float = 0.15,  # Cap on growth rate
+    min_growth_rate: float = -0.05,  # Floor on growth rate 
     seed: Optional[int] = None
 ) -> Dict:
     """
@@ -18,6 +21,10 @@ def simulate_firm_consumer_interaction(
         np.random.seed(seed)
     estimation_window = 10
     # Track metrics
+    experiment_obj = experiment.SwitchbackExperiment(firm.config)
+    gradient_estimates = []
+    estimation_times = []
+    
     # Other tracking metrics
     prices = []
     demands = []

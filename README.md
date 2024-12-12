@@ -33,7 +33,7 @@ Key components:
 
 3. **Price Experimentation**
    - Three-price switchback design
-   - Unbiased gradient estimation
+   - Unbiased gradient estimation (when following model with assumptions laid out in Wu et al)
    - Same-day vs total sales analysis
 
 4. **Market Mechanism**
